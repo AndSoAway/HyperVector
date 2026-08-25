@@ -37,6 +37,7 @@ set(HYPERVEC_SRC
   utils/structures/random.cpp
   utils/structures/sorting.cpp
   utils/structures/partitioning.cpp
+  utils/structures/sparse_row.cpp
   utils/algo/kmeans/kmeans.cpp
   quantization/pq/pq.cpp
   quantization/pq/pq_distance_computer.cpp
@@ -84,6 +85,7 @@ set(HYPERVEC_HEADERS
   include/utils/structures/heap.h
   include/utils/structures/random.h
   include/utils/structures/sorting.h
+  include/utils/structures/sparse_row.h
   include/utils/algo/kmeans/kmeans.h
   include/quantization/pq/pq.h
   include/quantization/pq/pq_distance_computer.h

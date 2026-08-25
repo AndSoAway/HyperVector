@@ -18,6 +18,8 @@
 #include <quantization/lvq/index_lvq.h>
 #include <quantization/lvq/index_ivflvq.h>
 #include <persistence/index_io.h>
+#include <persistence/io.h>
+#include <utils/structures/sparse_row.h>
 
 #include <cstring>
 #include <memory>
@@ -158,6 +160,65 @@ PyObject* index_search_with_params(const hypervec::Index* index, PyObject* obj,
   return result;
 }
 
+// Build a SparseRow from a Python dict {index: value}.  Indices must be
+// non-negative integers that fit in uint32; values are coerced to float.
+hypervec::SparseRow sparse_row_from_dict(PyObject* obj) {
+  if (!PyDict_Check(obj)) {
+    throw std::runtime_error("expected a dict {index: value}");
+  }
+  std::vector<uint32_t> indices;
+  std::vector<float> values;
+  PyObject* key;
+  PyObject* value;
+  Py_ssize_t pos = 0;
+  while (PyDict_Next(obj, &pos, &key, &value)) {
+    long long idx = PyLong_AsLongLong(key);
+    if (idx == -1 && PyErr_Occurred()) {
+      throw std::runtime_error("sparse index must be an integer");
+    }
+    if (idx < 0 || idx > 0xFFFFFFFFLL) {
+      throw std::runtime_error("sparse index out of uint32 range");
+    }
+    double val = PyFloat_AsDouble(value);
+    if (val == -1.0 && PyErr_Occurred()) {
+      throw std::runtime_error("sparse value must be a number");
+    }
+    indices.push_back(static_cast<uint32_t>(idx));
+    values.push_back(static_cast<float>(val));
+  }
+  return hypervec::SparseRow(std::move(indices), std::move(values));
+}
+
+// Serialize a SparseRow to a Python bytes object using the shared byte layout.
+PyObject* sparse_row_serialize(const hypervec::SparseRow* row) {
+  hypervec::VectorIOWriter wr;
+  hypervec::write_sparse_row(*row, &wr);
+  return PyBytes_FromStringAndSize(
+    reinterpret_cast<const char*>(wr.data.data()),
+    static_cast<Py_ssize_t>(wr.data.size()));
+}
+
+// Convert a SparseRow to a Python dict {index: value}.
+PyObject* sparse_row_to_dict(const hypervec::SparseRow* row) {
+  PyObject* d = PyDict_New();
+  if (d == nullptr) {
+    throw std::runtime_error("failed to allocate Python dict");
+  }
+  for (size_t i = 0; i < row->nnz(); ++i) {
+    PyObject* key = PyLong_FromUnsignedLong(row->index_at(i));
+    PyObject* val = PyFloat_FromDouble(row->value_at(i));
+    if (key == nullptr || val == nullptr || PyDict_SetItem(d, key, val) != 0) {
+      Py_XDECREF(key);
+      Py_XDECREF(val);
+      Py_DECREF(d);
+      throw std::runtime_error("failed to build sparse dict");
+    }
+    Py_DECREF(key);
+    Py_DECREF(val);
+  }
+  return d;
+}
+
 }  // namespace
 %}
 
@@ -239,6 +300,49 @@ struct IndexHNSWPQ : Index {
 
 void WriteIndex(const Index* idx, const char* fname, int io_flags = 0);
 Index* ReadIndex(const char* fname, int io_flags = 0);
+
+%nodefaultctor SparseRow;
+struct SparseRow {
+};
+
+%extend SparseRow {
+  // Construct from a Python dict {index: value}.
+  SparseRow(PyObject* mapping) {
+    return new hypervec::SparseRow(sparse_row_from_dict(mapping));
+  }
+
+  size_t nnz() const {
+    return $self->nnz();
+  }
+
+  uint32_t index_at(size_t i) const {
+    if (i >= $self->nnz()) {
+      throw std::runtime_error("SparseRow.index_at: index out of range");
+    }
+    return $self->index_at(i);
+  }
+
+  float value_at(size_t i) const {
+    if (i >= $self->nnz()) {
+      throw std::runtime_error("SparseRow.value_at: index out of range");
+    }
+    return $self->value_at(i);
+  }
+
+  void set(uint32_t index, float value) {
+    $self->set(index, value);
+  }
+
+  // Serialize to bytes using the shared cross-language layout.
+  PyObject* serialize() const {
+    return sparse_row_serialize($self);
+  }
+
+  // Convert to a Python dict {index: value}.
+  PyObject* to_dict() const {
+    return sparse_row_to_dict($self);
+  }
+}
 
 %extend Index {
   void train(PyObject* x) {
