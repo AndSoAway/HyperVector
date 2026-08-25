@@ -225,7 +225,22 @@ class HypervecServerEngine:
             return meta_or_manifest.vector_field
         if isinstance(meta_or_manifest, dict) and meta_or_manifest.get("vector_field"):
             return str(meta_or_manifest["vector_field"])
-        return self._field_name_by_datatype(meta_or_manifest, "FLOAT_VECTOR", default="vector")
+        for datatype in ("FLOAT_VECTOR", "SPARSE_FLOAT_VECTOR"):
+            name = self._field_name_by_datatype(meta_or_manifest, datatype, default="")
+            if name:
+                return name
+        return "vector"
+
+    def _vector_datatype(self, meta_or_manifest: CollectionMeta | dict[str, Any]) -> str:
+        """Return the datatype string of the vector field ("FLOAT_VECTOR" or "SPARSE_FLOAT_VECTOR")."""
+        vf = self._vector_field(meta_or_manifest)
+        for field in self._schema_fields(meta_or_manifest):
+            if str(field.get("name")) == vf:
+                return str(field.get("datatype", "FLOAT_VECTOR")).upper()
+        return "FLOAT_VECTOR"
+
+    def _is_sparse_collection(self, meta_or_manifest: CollectionMeta | dict[str, Any]) -> bool:
+        return self._vector_datatype(meta_or_manifest) == "SPARSE_FLOAT_VECTOR"
 
     def _text_field(self, meta_or_manifest: CollectionMeta | dict[str, Any]) -> str:
         for field in self._schema_fields(meta_or_manifest):
@@ -477,21 +492,25 @@ class HypervecServerEngine:
         with self._lock_for(collection_name).write_lock():
             meta = self._meta_or_raise(collection_name)
             self.scalar_store.ensure_table(collection_name)
+            is_sparse = self._is_sparse_collection(meta)
             dim = meta.dim
             rows = []
             next_row_id = self.scalar_store.next_row_id(collection_name)
             for i, row in enumerate(data):
                 if meta.vector_field not in row:
                     raise ValueError(f"row is missing vector field '{meta.vector_field}'.")
-                vector = np.asarray(row[meta.vector_field], dtype=np.float32)
-                if vector.ndim != 1:
-                    raise ValueError(f"row vector field '{meta.vector_field}' must be 1-D.")
-                if dim is None:
-                    dim = int(vector.size)
-                elif int(dim) != int(vector.size):
-                    raise ValueError(
-                        f"vector dimension {vector.size} does not match collection dim {dim}."
-                    )
+                if is_sparse:
+                    vector = self._normalize_sparse(row[meta.vector_field])
+                else:
+                    vector = np.asarray(row[meta.vector_field], dtype=np.float32)
+                    if vector.ndim != 1:
+                        raise ValueError(f"row vector field '{meta.vector_field}' must be 1-D.")
+                    if dim is None:
+                        dim = int(vector.size)
+                    elif int(dim) != int(vector.size):
+                        raise ValueError(
+                            f"vector dimension {vector.size} does not match collection dim {dim}."
+                        )
                 doc_id = row.get(meta.id_field, str(next_row_id + i))
                 text_content = row.get(meta.text_field, "")
                 structured_fields = {meta.id_field, meta.vector_field, meta.text_field}
@@ -519,10 +538,31 @@ class HypervecServerEngine:
             self._scalar_cache.pop(collection_name, None)
             return {"insert_count": len(data), "total": total}
 
+    @staticmethod
+    def _normalize_sparse(value: Any) -> dict:
+        """Normalise a sparse vector to dict[int, float].
+
+        Accepts:
+        - dict[int, float] (already normalised)
+        - {"indices": [...], "values": [...]} (Milvus/bundle export format)
+        """
+        if isinstance(value, dict):
+            if "indices" in value and "values" in value:
+                return {int(k): float(v) for k, v in zip(value["indices"], value["values"])}
+            return {int(k): float(v) for k, v in value.items()}
+        raise ValueError(
+            "sparse vector must be a dict or {'indices': [...], 'values': [...]}."
+        )
+
     def flush(self, collection_name: str) -> dict[str, Any]:
         collection_name = self.validate_collection_name(collection_name)
         with self._lock_for(collection_name).write_lock():
             meta = self._meta_or_raise(collection_name)
+            if self._is_sparse_collection(meta):
+                raise NotImplementedError(
+                    "sparse index building is not yet implemented; "
+                    "insert and export_rows are supported for SPARSE_FLOAT_VECTOR collections."
+                )
             if meta.dim is None:
                 raise ValueError(f"collection '{collection_name}' has no rows.")
             vectors = self.scalar_store.get_vectors(collection_name, int(meta.dim))
@@ -605,6 +645,12 @@ class HypervecServerEngine:
         collection_name = self.validate_collection_name(collection_name)
         if int(limit) <= 0:
             raise ValueError("limit must be positive.")
+        meta_check = self._meta_or_raise(collection_name)
+        if self._is_sparse_collection(meta_check):
+            raise NotImplementedError(
+                "sparse vector search is not yet implemented; "
+                "use search_by_full_text once BM25 indexing is available."
+            )
         lock = self._lock_for(collection_name)
         if collection_name not in self._indexes:
             with lock.write_lock():

@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import struct
 import threading
 import time
 from pathlib import Path
@@ -46,14 +47,43 @@ class ScalarStore:
         return cls._table(collection_name) + "__import"
 
     @staticmethod
+    def _encode_sparse(sparse: dict) -> bytes:
+        """Encode a sparse vector (dict[int, float]) to binary BLOB.
+
+        Format: 4-byte little-endian nnz, then nnz * (uint32 idx + float32 val).
+        Aligns with Milvus/knowhere SparseRow on-disk layout.
+        """
+        nnz = len(sparse)
+        parts = [struct.pack("<I", nnz)]
+        for idx, val in sorted(sparse.items()):
+            parts.append(struct.pack("<If", int(idx), float(val)))
+        return b"".join(parts)
+
+    @staticmethod
+    def _decode_sparse(data: bytes) -> dict:
+        """Decode a binary BLOB back to a sparse vector dict[int, float]."""
+        nnz = struct.unpack_from("<I", data, 0)[0]
+        result = {}
+        offset = 4
+        for _ in range(nnz):
+            idx, val = struct.unpack_from("<If", data, offset)
+            result[idx] = val
+            offset += 8
+        return result
+
+    @staticmethod
     def _encode_vector(vector: Any) -> bytes:
+        if isinstance(vector, dict):
+            return ScalarStore._encode_sparse(vector)
         arr = np.asarray(vector, dtype=np.float32, order="C")
         if arr.ndim != 1:
             raise ValueError("vector must be a 1-D array.")
         return arr.tobytes()
 
     @staticmethod
-    def _decode_vector(data: bytes, dim: int) -> np.ndarray:
+    def _decode_vector(data: bytes, dim: int | None) -> Any:
+        if dim is None:
+            return ScalarStore._decode_sparse(data)
         arr = np.frombuffer(data, dtype=np.float32)
         if arr.size != int(dim):
             raise ValueError(f"stored vector dim {arr.size} does not match collection dim {dim}.")
@@ -140,6 +170,12 @@ class ScalarStore:
             return np.empty((0, int(dim)), dtype=np.float32)
         return np.vstack(vectors).astype(np.float32, copy=False)
 
+    def get_sparse_vectors(self, collection_name: str) -> list:
+        """Return all sparse vectors ordered by row_id as list[dict[int, float]]."""
+        table = self._table(collection_name)
+        cur = self._conn().execute(f'SELECT vector FROM "{table}" ORDER BY row_id ASC')
+        return [self._decode_sparse(row["vector"]) for row in cur.fetchall()]
+
     def get_by_row_ids(
         self,
         collection_name: str,
@@ -191,9 +227,9 @@ class ScalarStore:
     def export_rows(self, collection_name: str) -> list[dict]:
         """Return all rows ordered by row_id, each as a plain dict.
 
-        Includes row_id, doc_id, vector (as list[float]), text_content,
-        metadata (dict), created_at, updated_at.  Used when building a
-        collection data bundle.
+        For dense vectors: "vector" is list[float].
+        For sparse vectors: "vector" is {"indices": [...], "values": [...]}.
+        Used when building a collection data bundle.
         """
         table = self._table(collection_name)
         try:
@@ -202,14 +238,6 @@ class ScalarStore:
                 f'created_at, updated_at FROM "{table}" ORDER BY row_id ASC'
             )
         except sqlite3.OperationalError:
-            # Any OperationalError on the SELECT could be a missing table, a
-            # locked database, a corrupt schema, or a broken view.  Matching
-            # the exception text is fragile (e.g. a view whose dependency is
-            # missing also raises "no such table: main.<dep>"), so instead
-            # query sqlite_schema explicitly: return [] only when the object
-            # truly does not exist at all; propagate every other OperationalError
-            # (locked, corrupt, etc.) unchanged so callers never mistake a
-            # transient failure for a legitimately empty collection.
             obj_exists = self._conn().execute(
                 "SELECT 1 FROM sqlite_schema WHERE type IN ('table','view') AND name=?",
                 (table,),
@@ -219,17 +247,41 @@ class ScalarStore:
             return []
         rows = []
         for row in cur.fetchall():
-            dim = len(np.frombuffer(row["vector"], dtype=np.float32))
+            raw = bytes(row["vector"])
+            vector = self._export_vector(raw)
             rows.append({
                 "row_id": int(row["row_id"]),
                 "doc_id": row["doc_id"],
-                "vector": self._decode_vector(row["vector"], dim).tolist(),
+                "vector": vector,
                 "text_content": row["text_content"],
                 "metadata": json.loads(row["metadata"] or "{}"),
                 "created_at": row["created_at"],
                 "updated_at": row["updated_at"],
             })
         return rows
+
+    @staticmethod
+    def _export_vector(raw: bytes) -> Any:
+        """Detect dense vs sparse from raw bytes and return JSON-serialisable form.
+
+        Dense: raw length is a multiple of 4 (float32s) AND does not match sparse
+        framing → list[float].
+        Sparse: first 4 bytes as nnz, remaining = nnz * 8 bytes → {"indices", "values"}.
+
+        Detection heuristic: try sparse decode first (nnz * 8 + 4 == len(raw));
+        fall back to dense.
+        """
+        if len(raw) >= 4:
+            nnz = struct.unpack_from("<I", raw, 0)[0]
+            if 4 + nnz * 8 == len(raw):
+                sparse = ScalarStore._decode_sparse(raw)
+                sorted_items = sorted(sparse.items())
+                return {
+                    "indices": [int(k) for k, _ in sorted_items],
+                    "values": [float(v) for _, v in sorted_items],
+                }
+        arr = np.frombuffer(raw, dtype=np.float32)
+        return arr.tolist()
 
     def import_rows(
         self,
@@ -252,7 +304,7 @@ class ScalarStore:
             (
                 int(r["row_id"]),
                 str(r["doc_id"]),
-                r["vector"],
+                self._import_vector(r["vector"]),
                 r.get("text_content", ""),
                 dict(r.get("metadata") or {}),
             )
@@ -281,6 +333,17 @@ class ScalarStore:
         )
         self._conn().commit()
         return len(rows)
+
+    @staticmethod
+    def _import_vector(vector: Any) -> Any:
+        """Normalise a vector from bundle JSON to the internal Python representation.
+
+        Dense: list[float] → kept as-is (encode_vector handles it).
+        Sparse: {"indices": [...], "values": [...]} → dict[int, float].
+        """
+        if isinstance(vector, dict) and "indices" in vector and "values" in vector:
+            return {int(k): float(v) for k, v in zip(vector["indices"], vector["values"])}
+        return vector
 
     def purge_collection_rows(self, collection_name: str) -> dict:
         """DROP the collection's table.  Returns summary dict."""
@@ -318,7 +381,7 @@ class ScalarStore:
                     (
                         int(r["row_id"]),
                         str(r["doc_id"]),
-                        sqlite3.Binary(self._encode_vector(r["vector"])),
+                        sqlite3.Binary(self._encode_vector(self._import_vector(r["vector"]))),
                         r.get("text_content", ""),
                         json.dumps(
                             dict(r.get("metadata") or {}),
