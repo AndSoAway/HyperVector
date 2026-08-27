@@ -91,6 +91,14 @@ struct SparseRow {
   /// Highest index + 1 (0 for an empty row).  Mirrors knowhere SparseRow::dim.
   uint32_t dim() const;
 
+  /// Sum of all stored values (BM25 document length = sum of term freqs).
+  /// O(nnz).  Header-only inline, consistent with nnz()/index_at/value_at.
+  float row_sum() const {
+    float s = 0.0f;
+    for (size_t i = 0; i < nnz(); ++i) s += value_at(i);
+    return s;
+  }
+
   /// Raw pointer to the packed element array (nnz() elements).
   const SparseElement* data() const {
     return reinterpret_cast<const SparseElement*>(buf_.data());

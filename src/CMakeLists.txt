@@ -89,6 +89,7 @@ set(HYPERVEC_HEADERS
   include/utils/structures/sparse_row.h
   include/utils/structures/term_dictionary.h
   include/utils/algo/kmeans/kmeans.h
+  include/utils/algo/sparse_vector/sparse_inverted_index.h
   include/quantization/pq/pq.h
   include/quantization/pq/pq_distance_computer.h
   include/quantization/pq/index_pq.h
