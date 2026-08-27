@@ -5,6 +5,7 @@
 %module swighypervec
 
 %include <stdint.i>
+%include <std_string.i>
 
 %{
 #include <Python.h>
@@ -20,6 +21,7 @@
 #include <persistence/index_io.h>
 #include <persistence/io.h>
 #include <utils/structures/sparse_row.h>
+#include <utils/structures/term_dictionary.h>
 
 #include <cstring>
 #include <memory>
@@ -219,6 +221,16 @@ PyObject* sparse_row_to_dict(const hypervec::SparseRow* row) {
   return d;
 }
 
+// Serialize a TermDictionary to a Python bytes object (cross-language
+// layout shared with the Python mirror).
+PyObject* term_dictionary_serialize(const hypervec::TermDictionary* dict) {
+  hypervec::VectorIOWriter wr;
+  hypervec::write_term_dictionary(*dict, &wr);
+  return PyBytes_FromStringAndSize(
+    reinterpret_cast<const char*>(wr.data.data()),
+    static_cast<Py_ssize_t>(wr.data.size()));
+}
+
 }  // namespace
 %}
 
@@ -341,6 +353,61 @@ struct SparseRow {
   // Convert to a Python dict {index: value}.
   PyObject* to_dict() const {
     return sparse_row_to_dict($self);
+  }
+
+  // Highest index + 1 (0 when empty).
+  uint32_t dim() const {
+    return $self->dim();
+  }
+
+  // Plain sparse inner product with another row.
+  float dot(const hypervec::SparseRow* other) const {
+    return $self->dot(*other);
+  }
+
+  // BM25 score with $self as the document (values = term frequencies) and
+  // query_idf as the query (values = IDF weights).
+  float dot_bm25(const hypervec::SparseRow* query_idf, float k1, float b,
+                 float avgdl, float doc_len) const {
+    hypervec::BM25Params params{k1, b, avgdl};
+    return $self->dot_bm25(*query_idf, params, doc_len);
+  }
+}
+
+%nodefaultctor TermDictionary;
+struct TermDictionary {
+};
+
+%extend TermDictionary {
+  TermDictionary() {
+    return new hypervec::TermDictionary();
+  }
+
+  // Return the id of `term`, allocating the next id (first-seen order)
+  // if unseen.
+  uint32_t get_or_add(const std::string& term) {
+    return $self->get_or_add(term);
+  }
+
+  bool contains(const std::string& term) const {
+    return $self->contains(term);
+  }
+
+  uint32_t id_of(const std::string& term) const {
+    return $self->id_of(term);
+  }
+
+  std::string term_of(uint32_t id) const {
+    return $self->term_of(id);
+  }
+
+  size_t size() const {
+    return $self->size();
+  }
+
+  // Serialize to bytes using the shared cross-language layout.
+  PyObject* serialize() const {
+    return term_dictionary_serialize($self);
   }
 }
 

@@ -13,46 +13,152 @@
 #include <utils/log/assert.h>
 
 #include <algorithm>
-#include <cerrno>
+#include <cmath>
 #include <cstring>
 #include <utility>
+#include <vector>
 
 namespace hypervec {
+
+namespace {
+
+// Build an owning packed byte buffer from a sorted list of SparseElements.
+MaybeOwnedVector<uint8_t> pack_elements(const std::vector<SparseElement>& elems) {
+  MaybeOwnedVector<uint8_t> buf(elems.size() * sizeof(SparseElement));
+  if (!elems.empty()) {
+    std::memcpy(buf.data(), elems.data(), buf.byte_size());
+  }
+  return buf;
+}
+
+}  // namespace
 
 SparseRow::SparseRow(std::vector<uint32_t> indices, std::vector<float> values) {
   HYPERVEC_THROW_IF_NOT_FMT(
     indices.size() == values.size(),
     "SparseRow: indices size %zd != values size %zd", indices.size(),
     values.size());
-  indices_ = std::move(indices);
-  values_ = std::move(values);
-  // Sort (index, value) pairs by index ascending to satisfy the layout
-  // contract.  Build an order permutation to avoid two parallel sorts.
-  std::vector<size_t> order(indices_.size());
-  for (size_t i = 0; i < order.size(); ++i) {
-    order[i] = i;
+  // Pack into SparseElement[] then sort by index ascending to satisfy the
+  // layout contract.
+  std::vector<SparseElement> elems(indices.size());
+  for (size_t i = 0; i < indices.size(); ++i) {
+    elems[i].index = indices[i];
+    elems[i].value = values[i];
   }
-  std::sort(order.begin(), order.end(),
-            [&](size_t a, size_t b) { return indices_[a] < indices_[b]; });
-  std::vector<uint32_t> sorted_idx(indices_.size());
-  std::vector<float> sorted_val(values_.size());
-  for (size_t i = 0; i < order.size(); ++i) {
-    sorted_idx[i] = indices_[order[i]];
-    sorted_val[i] = values_[order[i]];
+  std::sort(elems.begin(), elems.end(),
+            [](const SparseElement& a, const SparseElement& b) {
+              return a.index < b.index;
+            });
+  buf_ = pack_elements(elems);
+}
+
+SparseRow SparseRow::create_view(
+  void* address, size_t nnz,
+  const std::shared_ptr<MaybeOwnedVectorOwner>& owner) {
+  SparseRow row;
+  row.buf_ = MaybeOwnedVector<uint8_t>::create_view(
+    address, nnz * sizeof(SparseElement), owner);
+  return row;
+}
+
+uint32_t SparseRow::dim() const {
+  const size_t n = nnz();
+  if (n == 0) {
+    return 0;
   }
-  indices_ = std::move(sorted_idx);
-  values_ = std::move(sorted_val);
+  // Entries are sorted by index ascending, so the last one holds the max.
+  return index_at(n - 1) + 1;
 }
 
 void SparseRow::set(uint32_t index, float value) {
-  auto it = std::lower_bound(indices_.begin(), indices_.end(), index);
-  size_t pos = static_cast<size_t>(it - indices_.begin());
-  if (it != indices_.end() && *it == index) {
-    values_[pos] = value;  // overwrite existing
+  const size_t n = nnz();
+  const SparseElement* elems = data();
+  // Binary search for the insertion point by index.
+  size_t lo = 0;
+  size_t hi = n;
+  while (lo < hi) {
+    size_t mid = lo + (hi - lo) / 2;
+    if (elems[mid].index < index) {
+      lo = mid + 1;
+    } else {
+      hi = mid;
+    }
+  }
+  if (lo < n && elems[lo].index == index) {
+    // Overwrite existing value in place.  Requires an owning buffer; a viewed
+    // row asserts inside MaybeOwnedVector when we take a mutable pointer.
+    HYPERVEC_ASSERT_MSG(buf_.is_owned,
+                        "SparseRow::set cannot be performed on a viewed row");
+    SparseElement* mutable_elems =
+      reinterpret_cast<SparseElement*>(buf_.data());
+    mutable_elems[lo].value = value;
     return;
   }
-  indices_.insert(it, index);
-  values_.insert(values_.begin() + pos, value);
+  // Insert a new element at position `lo`, preserving order.
+  std::vector<SparseElement> elems_copy(n + 1);
+  for (size_t i = 0; i < lo; ++i) {
+    elems_copy[i] = elems[i];
+  }
+  elems_copy[lo].index = index;
+  elems_copy[lo].value = value;
+  for (size_t i = lo; i < n; ++i) {
+    elems_copy[i + 1] = elems[i];
+  }
+  buf_ = pack_elements(elems_copy);
+}
+
+float SparseRow::dot(const SparseRow& other, DocValueComputer computer,
+                     float other_extra) const {
+  const size_t n_a = nnz();
+  const size_t n_b = other.nnz();
+  const SparseElement* a = data();
+  const SparseElement* b = other.data();
+  float acc = 0.0f;
+  size_t i = 0;
+  size_t j = 0;
+  // Two-pointer merge over the shared indices (both rows are sorted).
+  while (i < n_a && j < n_b) {
+    if (a[i].index < b[j].index) {
+      ++i;
+    } else if (a[i].index > b[j].index) {
+      ++j;
+    } else {
+      const float other_val =
+        computer ? computer(b[j].value, other_extra) : b[j].value;
+      acc += a[i].value * other_val;
+      ++i;
+      ++j;
+    }
+  }
+  return acc;
+}
+
+float SparseRow::dot_bm25(const SparseRow& query_idf, const BM25Params& params,
+                          float doc_len) const {
+  const size_t n_doc = nnz();
+  const size_t n_q = query_idf.nnz();
+  const SparseElement* doc = data();
+  const SparseElement* q = query_idf.data();
+  const float avgdl = std::max(params.avgdl, 1.0f);
+  // BM25 denominator norm term is constant across matched terms for a document.
+  const float norm = params.k1 * (1.0f - params.b + params.b * doc_len / avgdl);
+  float acc = 0.0f;
+  size_t i = 0;
+  size_t j = 0;
+  while (i < n_doc && j < n_q) {
+    if (doc[i].index < q[j].index) {
+      ++i;
+    } else if (doc[i].index > q[j].index) {
+      ++j;
+    } else {
+      const float tf = doc[i].value;
+      const float weighted = tf * (params.k1 + 1.0f) / (tf + norm);
+      acc += q[j].value * weighted;  // query value = IDF
+      ++i;
+      ++j;
+    }
+  }
+  return acc;
 }
 
 void write_sparse_row(const SparseRow& row, IOWriter* f) {
@@ -74,17 +180,17 @@ SparseRow read_sparse_row(IOReader* f) {
   // Guard against corrupt / hostile nnz: each entry is 8 bytes on the wire.
   HYPERVEC_THROW_IF_NOT(static_cast<size_t>(nnz) <
                         (get_deserialization_vector_byte_limit() / 8));
-  SparseRow row;
-  row.indices_.resize(nnz);
-  row.values_.resize(nnz);
+  std::vector<SparseElement> elems(nnz);
   for (uint32_t i = 0; i < nnz; ++i) {
     uint32_t idx = 0;
     float val = 0.0f;
     READ1(idx);
     READ1(val);
-    row.indices_[i] = idx;
-    row.values_[i] = val;
+    elems[i].index = idx;
+    elems[i].value = val;
   }
+  SparseRow row;
+  row.buf_ = pack_elements(elems);
   return row;
 }
 

@@ -108,11 +108,17 @@ inline int __builtin_clzll(uint64_t x) {
 
 #define HYPERVEC_ALWAYS_INLINE __forceinline
 
-// MSVC uses pragma pack instead of __attribute__((packed))
-// Use HYPERVEC_PACK_STRUCTS_BEGIN/END to wrap packed structure definitions
+// MSVC uses pragma pack; MinGW/other _WIN32 compilers use the GCC attribute.
+// Use HYPERVEC_PACK_STRUCTS_BEGIN/END to wrap packed structure definitions.
+#ifdef _MSC_VER
 #define HYPERVEC_PACKED
 #define HYPERVEC_PACK_STRUCTS_BEGIN __pragma(pack(push, 1))
 #define HYPERVEC_PACK_STRUCTS_END __pragma(pack(pop))
+#else
+#define HYPERVEC_PACKED __attribute__((packed))
+#define HYPERVEC_PACK_STRUCTS_BEGIN
+#define HYPERVEC_PACK_STRUCTS_END
+#endif
 
 #else
 /*******************************************************
