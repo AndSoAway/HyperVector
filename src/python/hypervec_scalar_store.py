@@ -8,12 +8,19 @@ from __future__ import annotations
 import json
 import sqlite3
 import struct
+import sys
 import threading
 import time
 from pathlib import Path
 from typing import Any
 
 import numpy as np
+
+try:
+    from .hypervec_term_dictionary import TermDictionary
+except ImportError:  # pragma: no cover - supports direct file loading in tests
+    sys.path.insert(0, str(Path(__file__).parent))
+    from hypervec_term_dictionary import TermDictionary
 
 
 class ScalarStore:
@@ -103,6 +110,11 @@ class ScalarStore:
             )
             """
 
+    @staticmethod
+    def _terms_table(collection_name: str) -> str:
+        safe = "".join(c if c.isalnum() or c == "_" else "_" for c in collection_name)
+        return f"terms_{safe}"
+
     def ensure_table(self, collection_name: str) -> None:
         table = self._table(collection_name)
         conn = self._conn()
@@ -110,8 +122,61 @@ class ScalarStore:
         conn.execute(f'CREATE INDEX IF NOT EXISTS "{table}_doc_id" ON "{table}"(doc_id)')
         conn.commit()
 
+    def ensure_terms_table(self, collection_name: str) -> None:
+        """Create the per-collection term dictionary table if absent.
+
+        Stores the term-string <-> term-id mapping (see hypervec_term_dictionary
+        .TermDictionary) so string-keyed sparse vectors survive a restart with
+        stable ids.
+        """
+        terms = self._terms_table(collection_name)
+        conn = self._conn()
+        conn.execute(
+            f"""
+            CREATE TABLE IF NOT EXISTS "{terms}" (
+              term_id INTEGER PRIMARY KEY,
+              term TEXT UNIQUE NOT NULL
+            )
+            """
+        )
+        conn.commit()
+
+    def load_term_dictionary(self, collection_name: str) -> "TermDictionary":
+        """Load the persisted term dictionary, ordered by ascending term_id.
+
+        Returns an empty dictionary if the collection has no terms table.
+        """
+        terms = self._terms_table(collection_name)
+        exists = self._conn().execute(
+            "SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = ?",
+            (terms,),
+        ).fetchone()
+        dictionary = TermDictionary()
+        if exists is None:
+            return dictionary
+        cur = self._conn().execute(
+            f'SELECT term_id, term FROM "{terms}" ORDER BY term_id ASC'
+        )
+        for row in cur.fetchall():
+            # Rows are ordered by id, which equals first-seen order, so
+            # get_or_add reproduces the same id assignment.
+            dictionary.get_or_add(row["term"])
+        return dictionary
+
+    def save_term_dictionary(self, collection_name: str, dictionary: "TermDictionary") -> None:
+        """Upsert every (term_id, term) pair.  Idempotent and incremental."""
+        self.ensure_terms_table(collection_name)
+        terms = self._terms_table(collection_name)
+        conn = self._conn()
+        conn.executemany(
+            f'INSERT OR IGNORE INTO "{terms}" (term_id, term) VALUES (?, ?)',
+            [(term_id, term) for term_id, term in dictionary.items()],
+        )
+        conn.commit()
+
     def drop_table(self, collection_name: str) -> None:
         self._conn().execute(f'DROP TABLE IF EXISTS "{self._table(collection_name)}"')
+        self._conn().execute(f'DROP TABLE IF EXISTS "{self._terms_table(collection_name)}"')
         self._conn().commit()
 
     def count(self, collection_name: str) -> int:

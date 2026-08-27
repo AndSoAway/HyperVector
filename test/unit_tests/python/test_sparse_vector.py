@@ -32,6 +32,10 @@ def load_engine_module():
     return _load_module("src/python/hypervec_server_engine.py", "engine_under_test")
 
 
+def load_term_dictionary_module():
+    return _load_module("src/python/hypervec_term_dictionary.py", "term_dictionary_under_test")
+
+
 # ---------------------------------------------------------------------------
 # FakeHypervec (no C++ dependency — copied from test_hypervec_server_engine)
 # ---------------------------------------------------------------------------
@@ -438,3 +442,161 @@ def test_meta_dim_set_for_dense(tmp_path):
     engine.insert("dense", [{"id": "y", "vector": [0.1, 0.2, 0.3, 0.4], "contents": ""}])
     meta = engine.meta_store.get("dense")
     assert meta.dim == 4
+
+
+# ---------------------------------------------------------------------------
+# 14. TermDictionary: first-seen id allocation + serialization
+# ---------------------------------------------------------------------------
+
+def test_term_dictionary_first_seen_order():
+    mod = load_term_dictionary_module()
+    d = mod.TermDictionary()
+    assert d.get_or_add("banana") == 0
+    assert d.get_or_add("apple") == 1
+    assert d.get_or_add("cherry") == 2
+    assert d.get_or_add("apple") == 1  # repeat returns same id
+    assert len(d) == 3
+    assert d.id_of("cherry") == 2
+    assert d.term_of(0) == "banana"
+
+
+def test_term_dictionary_serialize_roundtrip():
+    mod = load_term_dictionary_module()
+    d = mod.TermDictionary()
+    for term in ("the", "quick", "brown"):
+        d.get_or_add(term)
+    restored = mod.TermDictionary.deserialize(d.serialize())
+    assert len(restored) == 3
+    assert restored.term_of(0) == "the"
+    assert restored.term_of(2) == "brown"
+    assert restored.id_of("quick") == 1
+
+
+def test_term_dictionary_byte_layout_contract():
+    # Cross-language contract B, must match the C++ test
+    # test_term_dictionary.cpp::ByteLayoutMatchesPythonContract:
+    # {"foo"} -> [uint32 n=1][uint32 len=3]["foo"] == 11 bytes.
+    mod = load_term_dictionary_module()
+    d = mod.TermDictionary()
+    d.get_or_add("foo")
+    blob = d.serialize()
+    assert len(blob) == 4 + 4 + 3
+    assert struct.unpack_from("<I", blob, 0)[0] == 1  # n_terms
+    assert struct.unpack_from("<I", blob, 4)[0] == 3  # term_len
+    assert blob[8:11] == b"foo"
+
+
+def test_term_dictionary_empty_layout():
+    mod = load_term_dictionary_module()
+    blob = mod.TermDictionary().serialize()
+    assert len(blob) == 4
+    assert struct.unpack_from("<I", blob, 0)[0] == 0
+
+
+# ---------------------------------------------------------------------------
+# 15. ScalarStore term dictionary persistence
+# ---------------------------------------------------------------------------
+
+def test_scalar_store_term_dictionary_persistence(tmp_path):
+    mod = load_scalar_store_module()
+    tdmod = load_term_dictionary_module()
+    store = mod.ScalarStore(tmp_path / "scalar.db")
+    d = tdmod.TermDictionary()
+    d.get_or_add("alpha")
+    d.get_or_add("beta")
+    store.save_term_dictionary("col", d)
+
+    # Reopen a fresh store on the same DB: ids remain stable and ordered.
+    store2 = mod.ScalarStore(tmp_path / "scalar.db")
+    loaded = store2.load_term_dictionary("col")
+    assert len(loaded) == 2
+    assert loaded.id_of("alpha") == 0
+    assert loaded.id_of("beta") == 1
+    # A subsequent unseen term continues the id sequence.
+    assert loaded.get_or_add("gamma") == 2
+
+
+def test_scalar_store_load_missing_term_dictionary_is_empty(tmp_path):
+    mod = load_scalar_store_module()
+    store = mod.ScalarStore(tmp_path / "scalar.db")
+    assert len(store.load_term_dictionary("nope")) == 0
+
+
+# ---------------------------------------------------------------------------
+# 16. Engine: string-keyed sparse terms {"term": weight}
+# ---------------------------------------------------------------------------
+
+def test_engine_insert_string_terms(tmp_path):
+    mod = load_engine_module()
+    engine = mod.HypervecServerEngine(str(tmp_path), hypervec_module=FakeHypervec())
+    engine.create_collection("sp_col", schema=SPARSE_SCHEMA)
+    result = engine.insert("sp_col", [
+        {"id": "d0", "sparse_vec": {"apple": 0.5, "banana": 1.2}, "contents": "fruit"},
+        {"id": "d1", "sparse_vec": {"apple": 0.3, "cherry": 0.9}, "contents": "more"},
+    ])
+    assert result["insert_count"] == 2
+    # Terms map to first-seen ids: apple=0, banana=1, cherry=2.
+    d = engine.scalar_store.load_term_dictionary("sp_col")
+    assert d.id_of("apple") == 0
+    assert d.id_of("banana") == 1
+    assert d.id_of("cherry") == 2
+
+
+def test_engine_export_string_terms_roundtrip(tmp_path):
+    mod = load_engine_module()
+    engine = mod.HypervecServerEngine(str(tmp_path), hypervec_module=FakeHypervec())
+    engine.create_collection("sp_col", schema=SPARSE_SCHEMA)
+    engine.insert("sp_col", [
+        {"id": "d0", "sparse_vec": {"apple": 0.5, "banana": 1.2}, "contents": "x"},
+    ])
+    # Engine export reverses term ids back to {"term": weight}.
+    rows = engine._sparse_row_to_terms(
+        engine.scalar_store.export_rows("sp_col")[0],
+        engine.scalar_store.load_term_dictionary("sp_col"),
+    )
+    v = rows["vector"]
+    assert set(v.keys()) == {"apple", "banana"}
+    assert v["apple"] == pytest.approx(0.5, abs=1e-6)
+    assert v["banana"] == pytest.approx(1.2, abs=1e-6)
+
+
+def test_engine_mixed_id_and_term_formats(tmp_path):
+    # Numeric-key / {"indices","values"} rows pass through as term ids;
+    # string-key rows go through the dictionary. Both coexist.
+    mod = load_engine_module()
+    engine = mod.HypervecServerEngine(str(tmp_path), hypervec_module=FakeHypervec())
+    engine.create_collection("sp_col", schema=SPARSE_SCHEMA)
+    engine.insert("sp_col", [
+        {"id": "d0", "sparse_vec": {"apple": 0.5}, "contents": "term"},
+        {"id": "d1", "sparse_vec": {"indices": [7], "values": [0.9]}, "contents": "ids"},
+        {"id": "d2", "sparse_vec": {3: 0.2}, "contents": "numeric"},
+    ])
+    assert engine.scalar_store.count("sp_col") == 3
+    d = engine.scalar_store.load_term_dictionary("sp_col")
+    # Only the string term was dictionary-mapped.
+    assert d.id_of("apple") == 0
+    assert len(d) == 1
+
+
+def test_normalize_sparse_string_terms_needs_dictionary(tmp_path):
+    mod = load_engine_module()
+    engine = mod.HypervecServerEngine
+    with pytest.raises(ValueError):
+        engine._normalize_sparse({"apple": 0.5}, None)
+    # Numeric keys do not require a dictionary.
+    assert engine._normalize_sparse({"3": 0.5}, None) == {3: 0.5}
+
+
+# ---------------------------------------------------------------------------
+# 17. Cross-language contract A: encode_sparse == C++ write_sparse_row
+# ---------------------------------------------------------------------------
+
+def test_encode_sparse_matches_cpp_contract_a():
+    # C++ test_sparse_row.cpp::ByteLayoutMatchesPythonContract asserts
+    # {3: 0.25} -> 12 bytes: nnz=1 @0, idx=3 @4, val=0.25 @8.
+    mod = load_scalar_store_module()
+    blob = mod.ScalarStore._encode_sparse({3: 0.25})
+    assert len(blob) == 4 + 8
+    assert struct.unpack_from("<I", blob, 0)[0] == 1
+    assert struct.unpack_from("<I", blob, 4)[0] == 3
+    assert struct.unpack_from("<f", blob, 8)[0] == pytest.approx(0.25)

@@ -493,6 +493,13 @@ class HypervecServerEngine:
             meta = self._meta_or_raise(collection_name)
             self.scalar_store.ensure_table(collection_name)
             is_sparse = self._is_sparse_collection(meta)
+            # Load the term dictionary once so string-keyed terms across all rows
+            # share stable, first-seen-order ids (and are persisted below).
+            term_dict = (
+                self.scalar_store.load_term_dictionary(collection_name)
+                if is_sparse
+                else None
+            )
             dim = meta.dim
             rows = []
             next_row_id = self.scalar_store.next_row_id(collection_name)
@@ -500,7 +507,7 @@ class HypervecServerEngine:
                 if meta.vector_field not in row:
                     raise ValueError(f"row is missing vector field '{meta.vector_field}'.")
                 if is_sparse:
-                    vector = self._normalize_sparse(row[meta.vector_field])
+                    vector = self._normalize_sparse(row[meta.vector_field], term_dict)
                 else:
                     vector = np.asarray(row[meta.vector_field], dtype=np.float32)
                     if vector.ndim != 1:
@@ -532,6 +539,10 @@ class HypervecServerEngine:
                 data_version=meta.data_version + 1,
             )
             self.scalar_store.insert_batch(collection_name, rows)
+            if is_sparse and term_dict is not None and len(term_dict) > 0:
+                # Persist any newly-allocated term ids so they stay stable across
+                # restarts and can reverse term_id -> term on export.
+                self.scalar_store.save_term_dictionary(collection_name, term_dict)
             total = self.scalar_store.count(collection_name)
             self.meta_store.update(collection_name, total=total)
             self._indexes.pop(collection_name, None)
@@ -539,20 +550,101 @@ class HypervecServerEngine:
             return {"insert_count": len(data), "total": total}
 
     @staticmethod
-    def _normalize_sparse(value: Any) -> dict:
-        """Normalise a sparse vector to dict[int, float].
+    def _is_numeric_key(key: Any) -> bool:
+        """Whether a sparse-dict key denotes a term id rather than a term string.
+
+        Keys arrive as strings over HTTP/gRPC (JSON object keys are always
+        strings), so a numeric-looking string like "3" is treated as a term id,
+        while "apple" is treated as a term string requiring dictionary mapping.
+        """
+        if isinstance(key, int):
+            return True
+        if isinstance(key, str):
+            try:
+                int(key)
+                return True
+            except ValueError:
+                return False
+        return False
+
+    @classmethod
+    def _normalize_sparse(cls, value: Any, dictionary: Any = None) -> dict:
+        """Normalise a sparse vector to dict[int, float] (keyed by term id).
 
         Accepts:
-        - dict[int, float] (already normalised)
-        - {"indices": [...], "values": [...]} (Milvus/bundle export format)
+        - {"indices": [...], "values": [...]} (Milvus/bundle export format);
+          indices are term ids, passed through directly.
+        - dict with numeric keys (term ids), passed through directly.
+        - dict with string-term keys (e.g. {"apple": 0.5}); each term is mapped
+          to a term id via `dictionary` (allocating new ids in first-seen order).
+          Requires `dictionary` to be provided.
         """
-        if isinstance(value, dict):
-            if "indices" in value and "values" in value:
-                return {int(k): float(v) for k, v in zip(value["indices"], value["values"])}
+        if not isinstance(value, dict):
+            raise ValueError(
+                "sparse vector must be a dict or {'indices': [...], 'values': [...]}."
+            )
+        if "indices" in value and "values" in value:
+            return {int(k): float(v) for k, v in zip(value["indices"], value["values"])}
+        if all(cls._is_numeric_key(k) for k in value):
             return {int(k): float(v) for k, v in value.items()}
-        raise ValueError(
-            "sparse vector must be a dict or {'indices': [...], 'values': [...]}."
-        )
+        # String-keyed terms: map each term to a term id via the dictionary.
+        if dictionary is None:
+            raise ValueError(
+                "string-keyed sparse vectors require a term dictionary; "
+                "call insert on a SPARSE_FLOAT_VECTOR collection."
+            )
+        return {dictionary.get_or_add(str(k)): float(v) for k, v in value.items()}
+
+    @staticmethod
+    def _sparse_row_to_terms(row: dict, dictionary: Any) -> dict:
+        """Rewrite an exported sparse row's vector from {"indices","values"}
+        (term ids) to {"term": weight} using the term dictionary.
+
+        Term ids without a dictionary entry are left as their string id, so a
+        partially-populated dictionary never drops data.
+        """
+        vector = row.get("vector")
+        if not (isinstance(vector, dict) and "indices" in vector and "values" in vector):
+            return row
+        terms: dict[str, float] = {}
+        for term_id, weight in zip(vector["indices"], vector["values"]):
+            try:
+                key = dictionary.term_of(int(term_id))
+            except (IndexError, ValueError):
+                key = str(term_id)
+            terms[key] = float(weight)
+        return {**row, "vector": terms}
+
+    @classmethod
+    def _rebuild_sparse_terms(cls, rows: list[dict]) -> tuple[Any, list[dict]]:
+        """Rebuild a term dictionary from imported sparse rows.
+
+        String-keyed rows ({"term": weight}) allocate term ids in first-seen
+        order and are rewritten to {"indices","values"}; rows already in
+        {"indices","values"} form (raw term ids) pass through unchanged.  Returns
+        (dictionary, rewritten_rows); the dictionary is empty when no row used
+        string terms.
+        """
+        from hypervec_term_dictionary import TermDictionary
+
+        dictionary = TermDictionary()
+        rewritten: list[dict] = []
+        for row in rows:
+            vector = row.get("vector")
+            if (
+                isinstance(vector, dict)
+                and "indices" not in vector
+                and "values" not in vector
+                and vector
+            ):
+                indices = [dictionary.get_or_add(str(term)) for term in vector]
+                values = [float(v) for v in vector.values()]
+                rewritten.append(
+                    {**row, "vector": {"indices": indices, "values": values}}
+                )
+            else:
+                rewritten.append(row)
+        return dictionary, rewritten
 
     def flush(self, collection_name: str) -> dict[str, Any]:
         collection_name = self.validate_collection_name(collection_name)
@@ -887,6 +979,16 @@ class HypervecServerEngine:
                     f"index.d={index.d} != meta.dim={meta.dim}."
                 )
             scalar_rows = self.scalar_store.export_rows(collection_name)
+            if self._is_sparse_collection(meta):
+                # Reverse term_id -> term so the exported bundle carries the
+                # original string terms ({"term": weight}).  Collections that
+                # only ever used raw term ids have an empty dictionary, in which
+                # case the {"indices","values"} form from the store is kept.
+                term_dict = self.scalar_store.load_term_dictionary(collection_name)
+                if len(term_dict) > 0:
+                    scalar_rows = [
+                        self._sparse_row_to_terms(row, term_dict) for row in scalar_rows
+                    ]
             # When no explicit destination is given (the HTTP download path),
             # build into a controlled temp subdir so a failed/cancelled export
             # never leaves a stray bundle in the collection root.  purge sweeps
@@ -1053,6 +1155,14 @@ class HypervecServerEngine:
                         f"scalar_rows={len(scalar_rows)}."
                     )
 
+                # Rebuild the term dictionary from string-keyed sparse rows (if
+                # any) and rewrite their vectors to term ids so the staging store
+                # receives the {"indices","values"} form it expects.  Persisted
+                # after the scalar commit succeeds.
+                import_term_dict = None
+                if self._is_sparse_collection(meta):
+                    import_term_dict, scalar_rows = self._rebuild_sparse_terms(scalar_rows)
+
                 # Stage scalar rows into a side table.
                 self.scalar_store.import_rows_to_staging(collection_name, scalar_rows)
 
@@ -1093,6 +1203,10 @@ class HypervecServerEngine:
                     index_path.replace(pre_import)
                 staging_index.replace(index_path)
                 self.scalar_store.commit_staging(collection_name)
+                if import_term_dict is not None and len(import_term_dict) > 0:
+                    self.scalar_store.save_term_dictionary(
+                        collection_name, import_term_dict
+                    )
                 file_info = index_file_info(index_path)
                 updated = self.meta_store.bump_version(
                     collection_name,
