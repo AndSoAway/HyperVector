@@ -600,3 +600,80 @@ def test_encode_sparse_matches_cpp_contract_a():
     assert struct.unpack_from("<I", blob, 0)[0] == 1
     assert struct.unpack_from("<I", blob, 4)[0] == 3
     assert struct.unpack_from("<f", blob, 8)[0] == pytest.approx(0.25)
+
+
+# ---------------------------------------------------------------------------
+# 18. C++ SparseRow codec dispatch + pure-Python fallback (verification item 4)
+# ---------------------------------------------------------------------------
+
+
+class _FakeCppSparseRow:
+    """Stand-in for hypervec.SparseRow whose serialize() independently
+    re-implements byte contract A (NOT via ScalarStore), so a byte-equality
+    assertion against the pure-Python encoder is a real cross-check."""
+
+    def __init__(self, mapping):
+        self._m = dict(mapping)
+
+    def serialize(self):
+        parts = [struct.pack("<I", len(self._m))]
+        for i, v in sorted(self._m.items()):
+            parts.append(struct.pack("<If", int(i), float(v)))
+        return b"".join(parts)
+
+    def to_dict(self):
+        return dict(self._m)
+
+
+def test_cpp_codec_absent_in_this_env():
+    # In this environment `import hypervec` crashes (missing native DLLs), so
+    # the probe must degrade to None and encode falls back to pure Python.
+    mod = load_scalar_store_module()
+    assert mod._cpp_sparse_codec() is None
+
+
+def test_cpp_encode_matches_pure_python(monkeypatch):
+    mod = load_scalar_store_module()
+    sample = {0: 1.5, 7: 0.25, 3: 2.0}
+    pure = mod.ScalarStore._encode_sparse_py(sample)
+    # Force the C++ path via a monkeypatched stand-in codec.
+    monkeypatch.setattr(mod, "_CPP_SPARSE_PROBED", True)
+    monkeypatch.setattr(mod, "_CPP_SPARSE_ROW", _FakeCppSparseRow)
+    cpp = mod.ScalarStore._encode_sparse(sample)
+    assert cpp == pure  # contract A: byte-identical
+
+
+def test_probe_degrades_on_import_error(monkeypatch):
+    mod = load_scalar_store_module()
+    import builtins
+    real_import = builtins.__import__
+
+    def boom(name, *a, **k):
+        if name == "hypervec":
+            raise ImportError("no hypervec here")
+        return real_import(name, *a, **k)
+
+    monkeypatch.setattr(mod, "_CPP_SPARSE_PROBED", False)
+    monkeypatch.setattr(mod, "_CPP_SPARSE_ROW", None)
+    monkeypatch.setattr(builtins, "__import__", boom)
+    assert mod._cpp_sparse_codec() is None
+    # And encode still works (pure-Python fallback), no crash.
+    assert mod.ScalarStore._encode_sparse({3: 0.25}) == mod.ScalarStore._encode_sparse_py({3: 0.25})
+
+
+def test_probe_degrades_on_system_exit(monkeypatch):
+    # hypervec/loader.py may sys.exit(1) on an unsupported CPU -> SystemExit,
+    # which is NOT an Exception subclass. The probe must still degrade to None.
+    mod = load_scalar_store_module()
+    import builtins
+    real_import = builtins.__import__
+
+    def sysexit(name, *a, **k):
+        if name == "hypervec":
+            raise SystemExit(1)
+        return real_import(name, *a, **k)
+
+    monkeypatch.setattr(mod, "_CPP_SPARSE_PROBED", False)
+    monkeypatch.setattr(mod, "_CPP_SPARSE_ROW", None)
+    monkeypatch.setattr(builtins, "__import__", sysexit)
+    assert mod._cpp_sparse_codec() is None

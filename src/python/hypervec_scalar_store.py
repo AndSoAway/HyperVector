@@ -23,6 +23,40 @@ except ImportError:  # pragma: no cover - supports direct file loading in tests
     from hypervec_term_dictionary import TermDictionary
 
 
+# Lazy, cached probe for an optional C++ SparseRow codec.  Returns the
+# hypervec.SparseRow class if a usable compiled extension is importable, else
+# None.  Robust by design: a crashing / absent / stale `hypervec` must NEVER
+# break the pure-Python fallback.  hypervec/loader.py can call sys.exit(1) on an
+# unsupported CPU (raising SystemExit, which is NOT an Exception subclass), so
+# we catch BaseException — this is load-bearing, not over-broad.  Tests
+# monkeypatch this function or reset the module globals to force either path.
+_CPP_SPARSE_ROW = None       # cached class-or-None after first probe
+_CPP_SPARSE_PROBED = False   # whether the probe has already run
+
+
+def _cpp_sparse_codec():
+    """Return hypervec.SparseRow (a usable C++ codec) or None.  Cached."""
+    global _CPP_SPARSE_ROW, _CPP_SPARSE_PROBED
+    if _CPP_SPARSE_PROBED:
+        return _CPP_SPARSE_ROW
+    _CPP_SPARSE_PROBED = True
+    try:
+        import hypervec  # may raise ImportError / DLL load error / SystemExit
+        row_cls = getattr(hypervec, "SparseRow", None)
+        if row_cls is None:
+            _CPP_SPARSE_ROW = None
+            return _CPP_SPARSE_ROW
+        # Smoke-test the surface once so a stale/partial binding is rejected.
+        probe = row_cls({0: 1.0})
+        if hasattr(probe, "serialize") and hasattr(probe, "to_dict"):
+            _CPP_SPARSE_ROW = row_cls
+        else:
+            _CPP_SPARSE_ROW = None
+    except BaseException:  # noqa: BLE001 - ImportError/AttributeError/SystemExit/DLL
+        _CPP_SPARSE_ROW = None
+    return _CPP_SPARSE_ROW
+
+
 class ScalarStore:
     def __init__(self, path: str | Path) -> None:
         self.path = Path(path)
@@ -57,9 +91,23 @@ class ScalarStore:
     def _encode_sparse(sparse: dict) -> bytes:
         """Encode a sparse vector (dict[int, float]) to binary BLOB.
 
-        Format: 4-byte little-endian nnz, then nnz * (uint32 idx + float32 val).
-        Aligns with Milvus/knowhere SparseRow on-disk layout.
+        Prefers the C++ SparseRow codec (hypervec.SparseRow.serialize) when the
+        compiled extension is available, falling back to the pure-Python struct
+        implementation otherwise.  Both produce the identical byte layout
+        (cross-language contract A): 4-byte LE nnz, then nnz*(uint32 idx +
+        float32 val), sorted by index.  Aligns with Milvus/knowhere SparseRow.
         """
+        row_cls = _cpp_sparse_codec()
+        if row_cls is not None:
+            try:
+                return bytes(row_cls(dict(sparse)).serialize())
+            except Exception:
+                pass  # any C++-path failure -> fall through to pure Python
+        return ScalarStore._encode_sparse_py(sparse)
+
+    @staticmethod
+    def _encode_sparse_py(sparse: dict) -> bytes:
+        """Pure-Python sparse encoder (fallback / source of truth for bytes)."""
         nnz = len(sparse)
         parts = [struct.pack("<I", nnz)]
         for idx, val in sorted(sparse.items()):
@@ -68,7 +116,13 @@ class ScalarStore:
 
     @staticmethod
     def _decode_sparse(data: bytes) -> dict:
-        """Decode a binary BLOB back to a sparse vector dict[int, float]."""
+        """Decode a binary BLOB back to a sparse vector dict[int, float].
+
+        Pure-Python only: the SWIG surface exposes SparseRow(dict)/serialize()/
+        to_dict() but NO bytes->SparseRow constructor, so the C++ codec cannot
+        round-trip bytes back to a row.  Contract A is an encode-side byte
+        claim; decode stays the single Python source of truth.
+        """
         nnz = struct.unpack_from("<I", data, 0)[0]
         result = {}
         offset = 4

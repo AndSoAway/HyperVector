@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 from pathlib import Path
 
 import numpy as np
@@ -277,5 +278,54 @@ def test_dual_path_shares_single_engine(tmp_path):
     assert engine.scalar_store.count("dual") == 1
     d = engine.scalar_store.load_term_dictionary("dual")
     assert d.id_of("apple") == 0
+    sparse = engine.scalar_store.get_sparse_vectors_from_column("dual")
+    assert sparse[0][d.id_of("apple")] == pytest.approx(0.5)
+
+
+# ---------------------------------------------------------------------------
+# 7. dual-path (verification item 7): gRPC servicer shares the same engine
+# ---------------------------------------------------------------------------
+
+def test_grpc_dual_path_shares_single_engine(tmp_path):
+    # gRPC leg of verification item 7. Skip-safe: grpc/proto are environment-
+    # fragile (gencode/runtime mismatch here). Call the servicer method DIRECTLY
+    # with a fake context -- no socket, no async, no port -- and assert the same
+    # shared engine reflects the insert, mirroring the HTTP dual-path proof.
+    pytest.importorskip("grpc")
+    try:
+        grpc_mod = _load_module(
+            "src/python/hypervec_grpc_server.py", "grpc_server_under_test"
+        )
+    except Exception as exc:  # RuntimeError (no grpc) or proto version mismatch
+        pytest.skip(f"gRPC server module unavailable: {exc}")
+
+    engine = make_engine(tmp_path)
+    engine.create_collection("dual", schema=DUAL_SCHEMA, index_params=DUAL_INDEX_PARAMS)
+    servicer = grpc_mod.HyperVecServicer(engine)  # same shared engine
+
+    # Insert(self, request, context): reads request.data_json (a JSON list of
+    # row dicts) + request.collection_name, calls engine.insert(name, data).
+    class _FakeReq:
+        collection_name = "dual"
+        data_json = json.dumps([
+            {"id": "g0", "vector": [1.0, 0.0, 0.0, 0.0],
+             "sparse_vec": {"apple": 0.5}, "contents": "grpc"},
+        ])
+
+    class _FakeCtx:
+        def set_code(self, *a):
+            pass
+
+        def set_details(self, *a):
+            pass
+
+        def abort(self, code, details):
+            raise AssertionError(f"gRPC abort {code}: {details}")
+
+    servicer.Insert(_FakeReq(), _FakeCtx())
+
+    # The single shared engine now reflects the gRPC insert.
+    assert engine.scalar_store.count("dual") == 1
+    d = engine.scalar_store.load_term_dictionary("dual")
     sparse = engine.scalar_store.get_sparse_vectors_from_column("dual")
     assert sparse[0][d.id_of("apple")] == pytest.approx(0.5)
