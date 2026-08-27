@@ -103,6 +103,7 @@ class ScalarStore:
               row_id INTEGER PRIMARY KEY,
               doc_id TEXT UNIQUE NOT NULL,
               vector BLOB NOT NULL,
+              sparse_vector BLOB,
               text_content TEXT,
               metadata TEXT,
               created_at REAL,
@@ -120,7 +121,20 @@ class ScalarStore:
         conn = self._conn()
         conn.execute(self._create_table_ddl(table))
         conn.execute(f'CREATE INDEX IF NOT EXISTS "{table}_doc_id" ON "{table}"(doc_id)')
+        self._ensure_sparse_column(table)
         conn.commit()
+
+    def _ensure_sparse_column(self, table: str) -> None:
+        """Add the nullable sparse_vector column to a pre-existing table.
+
+        Old collections created before dual-field support have only the dense
+        `vector` column; this migrates them idempotently on next open.  Fresh
+        tables already have the column from the DDL, so the ALTER is skipped.
+        """
+        conn = self._conn()
+        cols = {row["name"] for row in conn.execute(f'PRAGMA table_info("{table}")')}
+        if "sparse_vector" not in cols:
+            conn.execute(f'ALTER TABLE "{table}" ADD COLUMN sparse_vector BLOB')
 
     def ensure_terms_table(self, collection_name: str) -> None:
         """Create the per-collection term dictionary table if absent.
@@ -196,29 +210,51 @@ class ScalarStore:
     def insert_batch(
         self,
         collection_name: str,
-        rows: list[tuple[int, str, Any, str, dict[str, Any]]],
+        rows: list[tuple],
     ) -> None:
+        """Insert rows into a collection.
+
+        Each row is either a 5-tuple ``(row_id, doc_id, vector, text, metadata)``
+        (single-vector collections — dense OR sparse, stored in the `vector`
+        column) or a 6-tuple ``(row_id, doc_id, dense_vector, sparse_vector,
+        text, metadata)`` (dual-field collections; either vector may be None).
+        Dense goes in `vector`, sparse in the nullable `sparse_vector` column.
+        """
         table = self._table(collection_name)
         now = time.time()
+
+        def _row_values(row: tuple) -> tuple:
+            if len(row) == 6:
+                row_id, doc_id, dense_vector, sparse_vector, text_content, metadata = row
+            else:
+                row_id, doc_id, dense_vector, text_content, metadata = row
+                sparse_vector = None
+            dense_blob = sqlite3.Binary(self._encode_vector(dense_vector))
+            sparse_blob = (
+                sqlite3.Binary(self._encode_vector(sparse_vector))
+                if sparse_vector is not None
+                else None
+            )
+            return (
+                int(row_id),
+                str(doc_id),
+                dense_blob,
+                sparse_blob,
+                text_content,
+                json.dumps(metadata or {}, ensure_ascii=False, separators=(",", ":")),
+                now,
+                now,
+            )
+
         try:
             self._conn().executemany(
                 f"""
                 INSERT INTO "{table}"
-                  (row_id, doc_id, vector, text_content, metadata, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                  (row_id, doc_id, vector, sparse_vector, text_content, metadata,
+                   created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                [
-                    (
-                        int(row_id),
-                        str(doc_id),
-                        sqlite3.Binary(self._encode_vector(vector)),
-                        text_content,
-                        json.dumps(metadata or {}, ensure_ascii=False, separators=(",", ":")),
-                        now,
-                        now,
-                    )
-                    for row_id, doc_id, vector, text_content, metadata in rows
-                ],
+                [_row_values(row) for row in rows],
             )
             self._conn().commit()
         except sqlite3.IntegrityError as exc:
@@ -235,11 +271,34 @@ class ScalarStore:
             return np.empty((0, int(dim)), dtype=np.float32)
         return np.vstack(vectors).astype(np.float32, copy=False)
 
+    # Alias: dense-column reader (dual-field flush uses this name explicitly).
+    def get_dense_vectors(self, collection_name: str, dim: int) -> np.ndarray:
+        return self.get_vectors(collection_name, dim)
+
     def get_sparse_vectors(self, collection_name: str) -> list:
-        """Return all sparse vectors ordered by row_id as list[dict[int, float]]."""
+        """Return all sparse vectors ordered by row_id as list[dict[int, float]].
+
+        Reads the dense `vector` column — this is the single-field sparse path
+        where the sparse blob lives in `vector` (pure-sparse collections).
+        """
         table = self._table(collection_name)
         cur = self._conn().execute(f'SELECT vector FROM "{table}" ORDER BY row_id ASC')
         return [self._decode_sparse(row["vector"]) for row in cur.fetchall()]
+
+    def get_sparse_vectors_from_column(self, collection_name: str) -> list:
+        """Return sparse vectors from the dedicated `sparse_vector` column
+        (dual-field collections), ordered by row_id.  Rows with a NULL
+        sparse_vector yield an empty dict.
+        """
+        table = self._table(collection_name)
+        cur = self._conn().execute(
+            f'SELECT sparse_vector FROM "{table}" ORDER BY row_id ASC'
+        )
+        result = []
+        for row in cur.fetchall():
+            blob = row["sparse_vector"]
+            result.append(self._decode_sparse(blob) if blob is not None else {})
+        return result
 
     def get_by_row_ids(
         self,
@@ -299,8 +358,8 @@ class ScalarStore:
         table = self._table(collection_name)
         try:
             cur = self._conn().execute(
-                f'SELECT row_id, doc_id, vector, text_content, metadata, '
-                f'created_at, updated_at FROM "{table}" ORDER BY row_id ASC'
+                f'SELECT row_id, doc_id, vector, sparse_vector, text_content, '
+                f'metadata, created_at, updated_at FROM "{table}" ORDER BY row_id ASC'
             )
         except sqlite3.OperationalError:
             obj_exists = self._conn().execute(
@@ -314,7 +373,7 @@ class ScalarStore:
         for row in cur.fetchall():
             raw = bytes(row["vector"])
             vector = self._export_vector(raw)
-            rows.append({
+            entry = {
                 "row_id": int(row["row_id"]),
                 "doc_id": row["doc_id"],
                 "vector": vector,
@@ -322,7 +381,13 @@ class ScalarStore:
                 "metadata": json.loads(row["metadata"] or "{}"),
                 "created_at": row["created_at"],
                 "updated_at": row["updated_at"],
-            })
+            }
+            # Dual-field collections carry a second sparse vector in its own
+            # column; export it alongside the dense one.
+            sparse_raw = row["sparse_vector"]
+            if sparse_raw is not None:
+                entry["sparse_vector"] = self._export_vector(bytes(sparse_raw))
+            rows.append(entry)
         return rows
 
     @staticmethod
@@ -365,39 +430,42 @@ class ScalarStore:
         self.ensure_table(collection_name)
         if not rows:
             return 0
-        batch = [
-            (
-                int(r["row_id"]),
-                str(r["doc_id"]),
-                self._import_vector(r["vector"]),
-                r.get("text_content", ""),
-                dict(r.get("metadata") or {}),
-            )
-            for r in rows
-        ]
         table = self._table(collection_name)
         now = time.time()
         self._conn().executemany(
             f"""
             INSERT INTO "{table}"
-              (row_id, doc_id, vector, text_content, metadata, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+              (row_id, doc_id, vector, sparse_vector, text_content, metadata,
+               created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """,
             [
                 (
-                    int(row_id),
-                    str(doc_id),
-                    sqlite3.Binary(self._encode_vector(vector)),
-                    text_content,
-                    json.dumps(metadata or {}, ensure_ascii=False, separators=(",", ":")),
+                    int(r["row_id"]),
+                    str(r["doc_id"]),
+                    sqlite3.Binary(self._encode_vector(self._import_vector(r["vector"]))),
+                    self._encode_optional_sparse(r.get("sparse_vector")),
+                    r.get("text_content", ""),
+                    json.dumps(
+                        dict(r.get("metadata") or {}),
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                    ),
                     r.get("created_at") or now,
                     r.get("updated_at") or now,
                 )
-                for (row_id, doc_id, vector, text_content, metadata), r in zip(batch, rows)
+                for r in rows
             ],
         )
         self._conn().commit()
         return len(rows)
+
+    @classmethod
+    def _encode_optional_sparse(cls, sparse_vector: Any):
+        """Encode a bundle-JSON sparse vector to a BLOB, or None if absent."""
+        if sparse_vector is None:
+            return None
+        return sqlite3.Binary(cls._encode_vector(cls._import_vector(sparse_vector)))
 
     @staticmethod
     def _import_vector(vector: Any) -> Any:
@@ -439,14 +507,16 @@ class ScalarStore:
             conn.executemany(
                 f"""
                 INSERT INTO "{staging}"
-                  (row_id, doc_id, vector, text_content, metadata, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                  (row_id, doc_id, vector, sparse_vector, text_content, metadata,
+                   created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 [
                     (
                         int(r["row_id"]),
                         str(r["doc_id"]),
                         sqlite3.Binary(self._encode_vector(self._import_vector(r["vector"]))),
+                        self._encode_optional_sparse(r.get("sparse_vector")),
                         r.get("text_content", ""),
                         json.dumps(
                             dict(r.get("metadata") or {}),
