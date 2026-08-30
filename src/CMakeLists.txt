@@ -58,7 +58,6 @@ set(HYPERVEC_SRC
 
 set(HYPERVEC_HEADERS
   include/index/index.h
-  include/index/index_type.h
   include/index/ivf/index_ivf.h
   include/index/ivf/index_ivf_flat.h
   include/utils/distances/metric_type.h

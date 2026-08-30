@@ -8,9 +8,7 @@
 
 #pragma once
 
-#include <index/index_type.h>
 #include <utils/common/platform_macros.h>
-#include <utils/distances/metric_type.h>
 
 #include <string>
 #include <vector>
@@ -45,15 +43,9 @@ struct ServerConfig {
   bool enable_http2 = true;
 };
 
-struct IndexDefaultsConfig {
-  IndexType default_index_type = IndexType::kHnswFlat;
-  MetricType default_metric_type = kMetricL2;
-};
-
 struct HypervecConfig {
   LoggingConfig logging;
   ServerConfig server;
-  IndexDefaultsConfig index_defaults;
 };
 
 struct ConfigOption {
@@ -68,8 +60,5 @@ struct ConfigOption {
 HYPERVEC_API const std::vector<ConfigOption>& GetConfigOptions();
 HYPERVEC_API HypervecConfig DefaultRuntimeConfig();
 HYPERVEC_API std::string RenderSampleConfig();
-HYPERVEC_API std::string MetricTypeName(MetricType metric);
-HYPERVEC_API bool ParseMetricType(const std::string& value,
-                                  MetricType* metric);
 
 }  // namespace hypervec
