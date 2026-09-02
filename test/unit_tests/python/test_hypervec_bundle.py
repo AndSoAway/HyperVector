@@ -226,3 +226,63 @@ def test_bundle_read_rejects_noncontiguous_row_ids(tmp_path):
         assert "cover 0" in str(exc) or "contiguous" in str(exc) or "total" in str(exc)
     else:
         raise AssertionError("should reject non-contiguous row_ids")
+
+
+def _struct_time(year, mon=6, mday=15, hour=12, minute=30, sec=45):
+    import time
+
+    # tm_wday / tm_yday / tm_isdst are ignored by _zip_safe_date_time.
+    return time.struct_time((year, mon, mday, hour, minute, sec, 0, 1, -1))
+
+
+def test_zip_safe_date_time_preserves_normal_time():
+    bundle_mod = load_module("hypervec_bundle")
+    # A clock well inside [1980, 2107] must be recorded verbatim.
+    assert bundle_mod._zip_safe_date_time(_struct_time(2026)) == (
+        2026, 6, 15, 12, 30, 45,
+    )
+
+
+def test_zip_safe_date_time_clamps_future_and_past():
+    bundle_mod = load_module("hypervec_bundle")
+    # Year 2112 (the Issue #47 scenario) clamps to the upper boundary.
+    assert (
+        bundle_mod._zip_safe_date_time(_struct_time(2112))
+        == bundle_mod._ZIP_DOS_MAX_DATE_TIME
+    )
+    # Boundary years themselves are still representable, not clamped.
+    assert bundle_mod._zip_safe_date_time(_struct_time(2107)) == (
+        2107, 6, 15, 12, 30, 45,
+    )
+    assert bundle_mod._zip_safe_date_time(_struct_time(1980)) == (
+        1980, 6, 15, 12, 30, 45,
+    )
+    # A clock before the DOS epoch clamps to the lower boundary.
+    assert (
+        bundle_mod._zip_safe_date_time(_struct_time(1970))
+        == bundle_mod._ZIP_DOS_MIN_DATE_TIME
+    )
+
+
+def test_bundle_create_survives_clock_past_2107(tmp_path, monkeypatch):
+    bundle_mod = load_module("hypervec_bundle")
+    meta_mod = load_module("hypervec_meta_store")
+
+    # Simulate a machine whose clock has drifted to 2112 (Issue #47): without
+    # the clamp, zipfile would raise struct.error while writing the ZIP header.
+    monkeypatch.setattr(
+        bundle_mod.time, "localtime", lambda *a: _struct_time(2112, 1, 12, 7, 20, 23)
+    )
+
+    index_path = tmp_path / "index.hypervec"
+    index_path.write_bytes(b"idx")
+    meta = make_fake_meta(meta_mod)
+    out = tmp_path / "future.hypervec-bundle"
+
+    # Must not raise; the export continues despite the bad clock.
+    bundle_mod.create_bundle("testcol", index_path, [], meta, out)
+
+    with zipfile.ZipFile(out) as zf:
+        for info in zf.infolist():
+            # Every entry's timestamp is clamped into the representable window.
+            assert info.date_time == bundle_mod._ZIP_DOS_MAX_DATE_TIME
