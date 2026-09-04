@@ -274,22 +274,28 @@ target_link_libraries(swighypervec_avx512_spr PRIVATE hypervec_python_callbacks)
 target_link_libraries(swighypervec_sve PRIVATE hypervec_python_callbacks)
 target_link_libraries(hypervec_example_external_module PRIVATE hypervec_python_callbacks)
 
-configure_file(setup.py setup.py COPYONLY)
-configure_file(__init__.py __init__.py COPYONLY)
-configure_file(loader.py loader.py COPYONLY)
-configure_file(class_wrappers.py class_wrappers.py COPYONLY)
-configure_file(extra_wrappers.py extra_wrappers.py COPYONLY)
-configure_file(array_conversions.py array_conversions.py COPYONLY)
-configure_file(hypervec_index_io.py hypervec_index_io.py COPYONLY)
-configure_file(hypervec_meta_store.py hypervec_meta_store.py COPYONLY)
-configure_file(hypervec_scalar_store.py hypervec_scalar_store.py COPYONLY)
-configure_file(hypervec_bundle.py hypervec_bundle.py COPYONLY)
-configure_file(hypervec_server_engine.py hypervec_server_engine.py COPYONLY)
-configure_file(hypervec_http_server.py hypervec_http_server.py COPYONLY)
-configure_file(hypervec_grpc_server.py hypervec_grpc_server.py COPYONLY)
-configure_file(hypervec_dual_server.py hypervec_dual_server.py COPYONLY)
-configure_file(hypervec_pb2.py hypervec_pb2.py COPYONLY)
-configure_file(hypervec_pb2_grpc.py hypervec_pb2_grpc.py COPYONLY)
+# Python source modules — single source of truth is the src/python directory
+# itself, not a hand-maintained per-file list (Issue #41). GLOB + COPYONLY
+# mirrors every *.py into the build dir so `pip wheel .` (run from
+# build-docker/src/python) always sees exactly the file set that setup.py
+# packages; newly added modules can no longer drift out of the wheel.
+# CONFIGURE_DEPENDS re-runs the glob when files are added or removed.
+# Note: supersedes the per-file hypervec_bundle.py addition from #39 — the
+# glob already covers it (verified: 17 modules land in the wheel on both x86
+# and ARM).
+file(GLOB _python_src_modules CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/*.py")
+foreach(_py_module IN LISTS _python_src_modules)
+  get_filename_component(_py_name "${_py_module}" NAME)
+  configure_file("${_py_module}" "${_py_name}" COPYONLY)
+endforeach()
+unset(_python_src_modules)
+unset(_py_module)
+unset(_py_name)
+
+# Non-.py packaging metadata copied explicitly (setup.py consumes them from
+# the build dir when it assembles the hypervec/ sub-package).
+configure_file(__init__.pyi __init__.pyi COPYONLY)
+configure_file(py.typed py.typed COPYONLY)
 configure_file(hypervec.proto hypervec.proto COPYONLY)
 
 # file(GLOB files "${CMAKE_SOURCE_DIR}/contrib/*.py")

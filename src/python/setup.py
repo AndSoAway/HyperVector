@@ -5,6 +5,7 @@
 
 from __future__ import print_function
 
+import glob
 import os
 import platform
 import shutil
@@ -19,23 +20,20 @@ if os.path.exists("contrib"):
         shutil.copytree("contrib", "hypervec/contrib")
     else:
         shutil.copyfile("contrib", "hypervec/contrib")
-shutil.copyfile("__init__.py", "hypervec/__init__.py")
-shutil.copyfile("loader.py", "hypervec/loader.py")
-shutil.copyfile("class_wrappers.py", "hypervec/class_wrappers.py")
-shutil.copyfile("extra_wrappers.py", "hypervec/extra_wrappers.py")
-shutil.copyfile("array_conversions.py", "hypervec/array_conversions.py")
-shutil.copyfile("hypervec_index_io.py", "hypervec/hypervec_index_io.py")
-shutil.copyfile("hypervec_meta_store.py", "hypervec/hypervec_meta_store.py")
-shutil.copyfile("hypervec_scalar_store.py", "hypervec/hypervec_scalar_store.py")
-shutil.copyfile("hypervec_bundle.py", "hypervec/hypervec_bundle.py")
-shutil.copyfile("hypervec_server_engine.py", "hypervec/hypervec_server_engine.py")
-shutil.copyfile("hypervec_http_server.py", "hypervec/hypervec_http_server.py")
-shutil.copyfile("rwlock.py", "hypervec/rwlock.py")
-shutil.copyfile("examples_data.py", "hypervec/examples_data.py")
-shutil.copyfile("hypervec_grpc_server.py", "hypervec/hypervec_grpc_server.py")
-shutil.copyfile("hypervec_dual_server.py", "hypervec/hypervec_dual_server.py")
-shutil.copyfile("hypervec_pb2.py", "hypervec/hypervec_pb2.py")
-shutil.copyfile("hypervec_pb2_grpc.py", "hypervec/hypervec_pb2_grpc.py")
+# Copy every Python source module from the current directory (a faithful
+# mirror of src/python produced by CMake) into the hypervec sub-package.
+# Single source of truth is the directory contents rather than a hand-written
+# list, so a newly added module can no longer silently drop out of the wheel
+# (Issue #41). SWIG-generated wrappers are excluded here and copied below,
+# conditionally on the matching compiled library actually existing.
+# Note: supersedes the per-file hypervec_bundle.py copy added by #39 — the
+# glob covers it (verified: 17 modules land in the wheel on both x86/ARM).
+for _py_src in sorted(glob.glob("*.py")):
+    if _py_src == "setup.py":
+        continue
+    if _py_src.startswith("swighypervec") or _py_src == "Hypervec_example_external_module.py":
+        continue  # SWIG output — handled per detected architecture below
+    shutil.copyfile(_py_src, os.path.join("hypervec", _py_src))
 
 if os.path.exists("__init__.pyi"):
     shutil.copyfile("__init__.pyi", "hypervec/__init__.pyi")

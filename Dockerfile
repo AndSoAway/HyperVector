@@ -28,6 +28,7 @@ RUN apt-get update && \
         libopenblas-dev \
         liblapack-dev \
         python3 \
+        python3-dev \
         python3-pip \
         python3-venv \
     && rm -rf /var/lib/apt/lists/*
