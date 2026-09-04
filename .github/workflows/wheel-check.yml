@@ -1,0 +1,56 @@
+name: python-wheel-check
+
+# Automated version of the "build the wheel from the CMake build dir" gate
+# that D1/D2 were missing (Issue #41). The Python package is assembled from
+# two places that used to be maintained by hand — CMake configure_file list
+# and setup.py copyfile list — and a drift between them only surfaced as a
+# FileNotFoundError (missing rwlock.py / examples_data.py) when building the
+# Docker image, i.e. at deploy time. This job rebuilds the wheel from a clean
+# CMake build dir on every push/PR so the same failure becomes a CI error.
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  wheel:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            python3 python3-dev python3-pip python3-venv \
+            build-essential cmake ninja-build swig \
+            libopenblas-dev liblapack-dev
+
+      - name: Configure and build SWIG target
+        run: |
+          python3 -m venv /tmp/hv-venv
+          /tmp/hv-venv/bin/python -m pip install --upgrade pip setuptools wheel cmake numpy
+          /tmp/hv-venv/bin/cmake -S . -B build-wheel -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DBUILD_TESTING=OFF \
+            -DHYPERVEC_ENABLE_PYTHON=ON \
+            -DHYPERVEC_ENABLE_EXTRAS=OFF \
+            -DHYPERVEC_OPT_LEVEL=generic \
+            -DPython_EXECUTABLE=/tmp/hv-venv/bin/python
+          /tmp/hv-venv/bin/cmake --build build-wheel --target swighypervec
+
+      - name: Assemble wheel from the clean build dir snapshot
+        run: |
+          cd build-wheel/src/python
+          /tmp/hv-venv/bin/python -m pip wheel . --no-deps -w dist
+
+      - name: Install wheel and import gate
+        run: |
+          /tmp/hv-venv/bin/pip install numpy fastapi uvicorn hypercorn h2
+          /tmp/hv-venv/bin/pip install --force-reinstall --no-deps build-wheel/src/python/dist/*.whl
+          /tmp/hv-venv/bin/python - <<'PY'
+          import hypervec
+          import hypervec.hypervec_server_engine
+          import hypervec.hypervec_http_server
+          print("import-ok")
+          PY
