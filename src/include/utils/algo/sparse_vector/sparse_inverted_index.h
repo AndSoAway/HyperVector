@@ -35,11 +35,12 @@ struct SparseSearchParameters : SearchParameters {
  * deliberately contains NO algorithm.  It exists so the data-model layer
  * (SparseRow + TermDictionary) has a stable downstream contract to build on.
  *
- * Conventions: the graph-style virtuals (Add / Search) mirror hypervec::Index
- * (index.h) with PascalCase, idx_t counts/labels, raw out-params for
- * distances/labels, and an optional params pointer.  The data-shape accessors
- * (row_sum / dim) deliberately keep the lowercase names of their SparseRow
- * counterparts so the two layers read consistently.
+ * Conventions mirror hypervec::Index (index.h): PascalCase virtuals, idx_t
+ * counts/labels, raw out-params for distances/labels, and an optional params
+ * pointer.  The accessors are PascalCase (RowSum / Dim) for interface-internal
+ * consistency; they intentionally differ from the lowercase SparseRow members
+ * (row_sum / dim) because SparseRow is a data structure, not an Index-style
+ * algorithm object.
  */
 struct SparseInvertedIndex {
   virtual ~SparseInvertedIndex() = default;
@@ -54,10 +55,10 @@ struct SparseInvertedIndex {
                       const SparseSearchParameters* params = nullptr) const = 0;
 
   /// BM25 document length of stored `row` (sum of its term frequencies).
-  virtual float row_sum(idx_t row) const = 0;
+  virtual float RowSum(idx_t row) const = 0;
 
   /// Highest term id + 1 across the whole index.
-  virtual idx_t dim() const = 0;
+  virtual idx_t Dim() const = 0;
 };
 
 }  // namespace hypervec

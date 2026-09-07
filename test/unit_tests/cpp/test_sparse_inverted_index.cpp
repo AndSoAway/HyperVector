@@ -41,12 +41,12 @@ struct MockSparseInvertedIndex : SparseInvertedIndex {
     }
   }
 
-  float row_sum(idx_t row) const override {
+  float RowSum(idx_t row) const override {
     (void)row;
     return 0.0f;
   }
 
-  idx_t dim() const override { return dim_; }
+  idx_t Dim() const override { return dim_; }
 };
 
 }  // namespace
@@ -60,7 +60,7 @@ TEST(SparseInvertedIndex, InterfaceIsImplementable) {
   SparseRow rows[2] = {SparseRow({0, 2}, {1.0f, 2.0f}),
                        SparseRow({1}, {3.0f})};
   p->Add(2, rows, 3);
-  EXPECT_EQ(p->dim(), 3);
+  EXPECT_EQ(p->Dim(), 3);
 
   SparseSearchParameters params;
   params.bm25.k1 = 1.5f;
