@@ -61,15 +61,18 @@ struct BM25Params {
  * either own its bytes or be a zero-copy view over an external (e.g. mmap'd)
  * buffer.  data() exposes the packed array as a raw pointer for SIMD / merge.
  *
- * On-disk / serialized layout (little-endian, tightly packed, no padding):
+ * On-disk / serialized layout (tightly packed, no padding):
  *
  *   [uint32 nnz][ (uint32 index, float32 value) * nnz ]   // sorted by index
  *
- * Total size == 4 + 8 * nnz bytes.  This byte layout is a cross-language
- * contract shared with the Python ScalarStore (_encode_sparse / _decode_sparse
- * in src/python/hypervec_scalar_store.py): a blob produced here decodes there
- * and vice versa.  The `index` field holds a term id, not a term string; the
- * string term dictionary is maintained separately (see term_dictionary.h).
+ * Total size == 4 + 8 * nnz bytes.  Fields are written in native byte order
+ * (no explicit endian swap), so the layout is little-endian on the little-endian
+ * targets we support and byte-matches the Python ScalarStore contract
+ * (_encode_sparse / _decode_sparse in src/python/hypervec_scalar_store.py,
+ * which uses struct.pack("<If", ...)).  A big-endian build would not be
+ * cross-language compatible.  The `index` field holds a term id, not a term
+ * string; the string term dictionary is maintained separately (see
+ * term_dictionary.h).
  */
 struct SparseRow {
   SparseRow() = default;

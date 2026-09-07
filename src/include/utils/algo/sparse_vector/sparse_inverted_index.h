@@ -17,11 +17,14 @@ namespace hypervec {
  * Extends the shared SearchParameters base (defined in index.h).  SHAPE ONLY —
  * these are the parameters the future BM25 inverted-index task will consume;
  * no scoring is implemented here.  See knowhere GetDocValueBM25Computer.
+ *
+ * The BM25 tuning constants live in a nested BM25Params (defined in
+ * sparse_row.h) rather than being duplicated here, so the scoring path can pass
+ * `params.bm25` straight to SparseRow::dot_bm25 with no field-by-field copy and
+ * no risk of the two definitions drifting apart.
  */
 struct SparseSearchParameters : SearchParameters {
-  float k1 = 1.2f;
-  float b = 0.75f;
-  float avgdl = 1.0f;  // average document length; clamped to >= 1.0 when applied
+  BM25Params bm25{1.2f, 0.75f, 1.0f};  // k1, b, avgdl (avgdl clamped >= 1.0)
 };
 
 /** Abstract interface mirroring Milvus/knowhere's InvertedIndex SHAPE.
@@ -32,8 +35,11 @@ struct SparseSearchParameters : SearchParameters {
  * deliberately contains NO algorithm.  It exists so the data-model layer
  * (SparseRow + TermDictionary) has a stable downstream contract to build on.
  *
- * Conventions mirror hypervec::Index (index.h): PascalCase virtuals, idx_t
- * counts/labels, raw out-params for distances/labels, optional params pointer.
+ * Conventions: the graph-style virtuals (Add / Search) mirror hypervec::Index
+ * (index.h) with PascalCase, idx_t counts/labels, raw out-params for
+ * distances/labels, and an optional params pointer.  The data-shape accessors
+ * (row_sum / dim) deliberately keep the lowercase names of their SparseRow
+ * counterparts so the two layers read consistently.
  */
 struct SparseInvertedIndex {
   virtual ~SparseInvertedIndex() = default;

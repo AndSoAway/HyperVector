@@ -138,8 +138,11 @@ TEST(SparseRow, ViewSharesBytesAndIsReadOnly) {
   EXPECT_EQ(view.index_at(2), 3u);
   EXPECT_FLOAT_EQ(view.value_at(1), 0.2f);
   EXPECT_EQ(view, owning);
-  // set() on a view asserts (HYPERVEC_ASSERT aborts); use death test.
-  EXPECT_DEATH_IF_SUPPORTED(view.set(4, 0.4f), "");
+  // set() on a view asserts (HYPERVEC_ASSERT aborts) on every path — both
+  // overwriting an existing index (2 is present) and inserting a new one
+  // (99 is absent, which would otherwise COW the shared bytes).
+  EXPECT_DEATH_IF_SUPPORTED(view.set(2, 0.99f), "viewed row");
+  EXPECT_DEATH_IF_SUPPORTED(view.set(99, 0.4f), "viewed row");
 }
 
 // Plain sparse inner product over shared indices.

@@ -64,9 +64,15 @@ void write_term_dictionary(const TermDictionary& dict, IOWriter* f) {
 TermDictionary read_term_dictionary(IOReader* f) {
   uint32_t n_terms = 0;
   READ1(n_terms);
-  // Guard against corrupt / hostile counts.
+  // Guard against corrupt / hostile counts.  Each entry materializes a
+  // std::string (~sizeof(std::string) bytes of control block before any heap
+  // buffer), so bound n_terms by the byte limit divided by that per-entry cost
+  // rather than by the raw byte count — otherwise reserve() below could be
+  // coaxed into a ~sizeof(std::string)x allocation blow-up.  Mirrors the
+  // byte_limit/8 guard in read_sparse_row.
   HYPERVEC_THROW_IF_NOT(static_cast<size_t>(n_terms) <
-                        get_deserialization_vector_byte_limit());
+                        (get_deserialization_vector_byte_limit() /
+                         sizeof(std::string)));
   TermDictionary dict;
   dict.id_to_term_.reserve(n_terms);
   for (uint32_t id = 0; id < n_terms; ++id) {

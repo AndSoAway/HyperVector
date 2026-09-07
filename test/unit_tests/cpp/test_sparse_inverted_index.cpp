@@ -63,9 +63,9 @@ TEST(SparseInvertedIndex, InterfaceIsImplementable) {
   EXPECT_EQ(p->dim(), 3);
 
   SparseSearchParameters params;
-  params.k1 = 1.5f;
-  params.b = 0.6f;
-  params.avgdl = 10.0f;
+  params.bm25.k1 = 1.5f;
+  params.bm25.b = 0.6f;
+  params.bm25.avgdl = 10.0f;
   const SearchParameters* base = &params;  // up-cast must compile
   EXPECT_NE(base, nullptr);
 }
