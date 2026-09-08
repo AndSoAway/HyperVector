@@ -142,6 +142,36 @@ def validate_index_label_mapping(
 # Helpers
 # ---------------------------------------------------------------------------
 
+# The ZIP DOS date format encodes the year as an offset from 1980 in a field
+# that tops out at 2107; seconds are stored with 2-second granularity.  A
+# system clock outside [1980, 2107] therefore cannot be represented and makes
+# zipfile raise struct.error while writing the header.  We clamp to these
+# boundaries instead of failing (or discarding the timestamp entirely).
+_ZIP_DOS_MIN_DATE_TIME = (1980, 1, 1, 0, 0, 0)
+_ZIP_DOS_MAX_DATE_TIME = (2107, 12, 31, 23, 59, 58)  # 58: last even second
+
+
+def _zip_safe_date_time(
+    t: "time.struct_time",
+) -> tuple[int, int, int, int, int, int]:
+    """Clamp a local time to the range a ZIP DOS date can represent.
+
+    Returns the (year, month, day, hour, minute, second) 6-tuple that
+    ``ZipInfo.date_time`` expects.  Within [1980, 2107] the real wall-clock
+    time is preserved so the bundle records when it was exported; only a clock
+    that has drifted outside that window is snapped to the nearest boundary,
+    which keeps ``create_bundle`` from raising struct.error on such machines.
+
+    Note the DOS format carries no timezone, so this is naturally local time —
+    matching how unzip tools interpret the field.
+    """
+    if t.tm_year < 1980:
+        return _ZIP_DOS_MIN_DATE_TIME
+    if t.tm_year > 2107:
+        return _ZIP_DOS_MAX_DATE_TIME
+    return (t.tm_year, t.tm_mon, t.tm_mday, t.tm_hour, t.tm_min, t.tm_sec)
+
+
 def schema_checksum(schema: dict[str, Any] | None) -> str:
     """Deterministic SHA-256 of a collection schema.
 
@@ -212,12 +242,24 @@ def create_bundle(
     }
     manifest_bytes = json.dumps(manifest, ensure_ascii=False, indent=2).encode("utf-8")
 
+    # ZIP entry timestamps should record when the export actually happened, so
+    # we take the real local time and only fall back to a boundary when the
+    # system clock lands outside the range the DOS date format can represent
+    # (see _zip_safe_date_time).  This keeps timestamps meaningful in normal
+    # operation while never letting a misconfigured clock raise struct.error.
+    date_time = _zip_safe_date_time(time.localtime())
+
+    def _zip_info(name: str) -> zipfile.ZipInfo:
+        info = zipfile.ZipInfo(name, date_time=date_time)
+        info.compress_type = zipfile.ZIP_DEFLATED
+        return info
+
     tmp = output_path.with_suffix(output_path.suffix + ".tmp")
     try:
         with zipfile.ZipFile(tmp, "w", compression=zipfile.ZIP_DEFLATED) as zf:
-            zf.writestr(_MANIFEST, manifest_bytes)
-            zf.writestr(_INDEX, index_bytes)
-            zf.writestr(_SCALAR, scalar_bytes)
+            zf.writestr(_zip_info(_MANIFEST), manifest_bytes)
+            zf.writestr(_zip_info(_INDEX), index_bytes)
+            zf.writestr(_zip_info(_SCALAR), scalar_bytes)
         tmp.replace(output_path)
     except Exception:
         tmp.unlink(missing_ok=True)
